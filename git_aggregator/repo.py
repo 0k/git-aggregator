@@ -8,6 +8,9 @@ import os
 import logging
 import re
 import subprocess
+import sys
+import textwrap
+import colorama
 
 import requests
 
@@ -30,6 +33,102 @@ def ishex(s):
     except ValueError:
         return False
     return True
+
+
+PLT_CFG = {'close_fds': False if sys.platform == 'win32' else True}
+
+
+class ShellError(Exception):
+
+    def __init__(self, msg, errlvl=None, command=None, out=None, err=None, cwd=None):
+        self.errlvl = errlvl
+        self.command = command
+        self.out = out
+        self.err = err
+        self.cwd = cwd
+        super(ShellError, self).__init__(msg)
+
+
+class ShellTimeout(ShellError):
+    """Raised when a shell command times out."""
+
+
+def cmd(command, env=None, shell=True, cwd=None, timeout=None):
+    p = subprocess.Popen(
+        command,
+        shell=shell,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=PLT_CFG['close_fds'], env=env,
+        cwd=cwd,
+        universal_newlines=False)
+    out, err = p.communicate(timeout=timeout)
+    return (
+        out.decode(getattr(sys.stdout, "encoding", None) or
+                      _preferred_encoding),
+        err.decode(getattr(sys.stderr, "encoding", None) or
+                      _preferred_encoding),
+        p.returncode)
+
+
+def wrap(command, ignore_errlvls=[0], env=None, **kw):
+    """Wraps a shell command and casts an exception on unexpected errlvl
+
+    >>> wrap('/tmp/lsdjflkjf') # doctest: +ELLIPSIS +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+    ...
+    ShellError: Wrapped command '/tmp/lsdjflkjf' exited with errorlevel 127.
+      stderr:
+      | /bin/sh: .../tmp/lsdjflkjf: not found
+
+    >>> print(wrap('echo hello'),  end='')
+    hello
+
+    >>> print(wrap('echo hello && false'),
+    ...       end='')  # doctest: +ELLIPSIS +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+    ...
+    ShellError: Wrapped command 'echo hello && false' exited with errorlevel 1.
+      stdout:
+      | hello
+
+    """
+    timeout = 0
+    try:
+        out, err, errlvl = cmd(command, env=env, shell=isinstance(command, str), **kw)
+    except subprocess.TimeoutExpired as e:
+        timeout = e.timeout
+        out, err, errlvl = ((e.stdout or b'').decode(getattr(sys.stdout, "encoding", None) or
+                                            _preferred_encoding),
+                            (e.stderr or b'').decode(getattr(sys.stderr, "encoding", None) or
+                                            _preferred_encoding),
+                            None)
+
+    if timeout or errlvl not in ignore_errlvls:
+
+        formatted = []
+        if out:
+            if out.endswith('\n'):
+                out = out[:-1]
+            formatted.append("stdout:\n%s" % textwrap.indent(out, "| ", lambda l: True))
+        if err:
+            if err.endswith('\n'):
+                err = err[:-1]
+            formatted.append("stderr:\n%s" % textwrap.indent(err, "| ", lambda l: True))
+        msg = textwrap.indent('\n'.join(formatted), "  ", lambda l: True)
+        cwd = kw.get('cwd', os.getcwd())
+        if timeout:
+            raise ShellTimeout("Wrapped command %r timed out after %d seconds.\n%s"
+                               % (command, timeout, msg),
+                               command=command, out=out, err=err,
+                               cwd=cwd)
+        raise ShellError("Wrapped command %r exited with errorlevel %d.\n%s"
+                         % (command, errlvl, msg),
+                         errlvl=errlvl, command=command, out=out, err=err,
+                         cwd=cwd)
+    return out
+
 
 
 class Repo(object):
@@ -139,8 +238,8 @@ class Repo(object):
                  notably if ref if a commit sha (they can't be queried)
         """
         out = self.log_call(['git', 'ls-remote', remote, ref],
-                            cwd=self.cwd if os.path.exists(self.cwd) else None,
-                            callwith=subprocess.check_output).strip()
+                            cwd=self.cwd if os.path.exists(self.cwd) else None
+                            ).strip()
         for sha, fullref in (line.split() for line in out.splitlines()):
             if fullref == 'refs/heads/' + ref:
                 return 'branch', sha
@@ -150,19 +249,28 @@ class Repo(object):
                 return 'HEAD', sha
         return None, ref
 
-    def log_call(self, cmd, callwith=subprocess.check_call,
+    def log_call(self, cmd,
                  log_level=logging.DEBUG, **kw):
         """Wrap a subprocess call with logging
         :param meth: the calling method to use.
         """
-        logger.log(log_level, "%s> call %r", self.cwd, cmd)
+        if isinstance(cmd, (list, tuple)):
+            if all(" " not in c for c in cmd):
+                command_str = " ".join(cmd)
+            else:
+                command_str = repr(cmd)
+        else:
+            command_str = cmd
+
+        logger.log(log_level, "Run: %s", command_str)
         try:
-            ret = callwith(cmd, **kw)
+            ret = wrap(cmd, **kw)
         except Exception:
-            logger.error("%s> error calling %r", self.cwd, cmd)
+            logger.error(
+                f"{colorama.Fore.RED}Error calling{colorama.Fore.RESET}: %s",
+                command_str
+            )
             raise
-        if callwith == subprocess.check_output:
-            ret = console_to_str(ret)
         return ret
 
     def aggregate(self):
@@ -262,7 +370,6 @@ class Repo(object):
         logger.info('Checking repo status')
         status = self.log_call(
             ['git', 'status', '--porcelain'],
-            callwith=subprocess.check_output,
             cwd=self.cwd,
         )
         if status:
@@ -318,7 +425,6 @@ class Repo(object):
     def _get_remotes(self):
         lines = self.log_call(
             ['git', 'remote', '-v'],
-            callwith=subprocess.check_output,
             cwd=self.cwd).splitlines()
         remotes = {}
         for line in lines:

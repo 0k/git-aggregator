@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import threading
+import textwrap
 import traceback
 try:
     from Queue import Queue, Empty as EmptyQueue
@@ -21,7 +22,7 @@ from .utils import ThreadNameKeeper
 from .log import DebugLogFormatter
 from .log import LogFormatter
 from .config import load_config
-from .repo import Repo
+from .repo import Repo, ShellError
 
 
 logger = logging.getLogger(__name__)
@@ -235,7 +236,7 @@ def aggregate_repo(repo, args, sem, err_queue):
         elif args.command == 'show-all-prs':
             repo.show_all_prs()
     except Exception:
-        err_queue.put_nowait(sys.exc_info())
+        err_queue.put_nowait((os.path.basename(repo.cwd), sys.exc_info()))
     finally:
         sem.release()
 
@@ -276,10 +277,74 @@ def run(args):
         t.join()
 
     if not err_queue.empty():
+        if jobs > 1:
+            nb_err = err_queue.qsize()
+            print(f"{colorama.Fore.RED}Errors{colorama.Fore.RESET}"
+                  f" for {colorama.Fore.RED}{nb_err}{colorama.Fore.RESET} repositories (at least):", file=sys.stderr)
         while True:
             try:
-                exc_type, exc_obj, exc_trace = err_queue.get_nowait()
+                tname, (exc_type, exc_obj, exc_trace) = err_queue.get_nowait()
             except EmptyQueue:
                 break
-            traceback.print_exception(exc_type, exc_obj, exc_trace)
+            print(f"  {colorama.Fore.RED}Error{colorama.Fore.RESET}"
+                  f" for repository {colorama.Fore.BLUE}{colorama.Style.DIM}{colorama.Style.BRIGHT}"
+                      f"{colorama.Style.BRIGHT}{tname}{colorama.Style.RESET_ALL}:", file=sys.stderr)
+            if issubclass(exc_type, ShellError):
+                if isinstance(exc_obj.command, (list, tuple)):
+                    if all(" " not in c for c in exc_obj.command):
+                        command_str = " ".join(exc_obj.command)
+                    else:
+                        command_str = repr(exc_obj.command)
+                else:
+                    command_str = exc_obj.command
+                formatted = []
+                if exc_obj.cwd:
+                    formatted += [
+                        f"{colorama.Fore.YELLOW}cwd{colorama.Style.RESET_ALL}: "
+                        f"{colorama.Fore.BLUE}{colorama.Style.BRIGHT}{exc_obj.cwd}{colorama.Style.RESET_ALL}"
+                    ]
+                formatted += [
+                    f"{colorama.Fore.YELLOW}command{colorama.Style.RESET_ALL}:\n"
+                    f"  {colorama.Fore.BLACK}{colorama.Style.DIM}|{colorama.Style.RESET_ALL} "
+                    f"{colorama.Fore.WHITE}{command_str}{colorama.Style.RESET_ALL}"
+                ]
+                out = exc_obj.out
+                if out:
+                    if out.endswith('\n'):
+                        out = out[:-1]
+                    formatted.append(
+                        f"{colorama.Fore.YELLOW}stdout{colorama.Style.RESET_ALL}:\n%s"
+                        % textwrap.indent(
+                            out,
+                            f"  {colorama.Fore.BLACK}{colorama.Style.DIM}|{colorama.Style.RESET_ALL} ",
+                        lambda _: True)
+                    )
+                err = exc_obj.err
+                if err:
+                    if err.endswith('\n'):
+                        err = err[:-1]
+                    formatted.append(
+                        f"{colorama.Fore.YELLOW}stderr{colorama.Style.RESET_ALL}:\n%s"
+                        % textwrap.indent(
+                            err,
+                            f"  {colorama.Fore.RED}{colorama.Style.BRIGHT}|{colorama.Style.RESET_ALL} ",
+                        lambda _: True)
+                    )
+                if exc_obj.errlvl is not None:
+                    formatted.append(
+                        f"{colorama.Fore.YELLOW}errorlevel{colorama.Style.RESET_ALL}: "
+                        f"{colorama.Fore.RED if exc_obj.errlvl else colorama.Fore.GREEN}"
+                        f"{colorama.Style.BRIGHT}{exc_obj.errlvl}{colorama.Style.RESET_ALL}"
+                    )
+                msg = '\n'.join(formatted) + "\n"
+            else:
+                msg = "".join(traceback.format_exception(exc_type, exc_obj, exc_trace))
+
+            if jobs > 1:
+                msg = textwrap.indent(
+                    msg,
+                    f"  {colorama.Fore.RED}|{colorama.Fore.RESET} ",
+                    lambda _: True
+                )
+            print(msg, file=sys.stderr)
         sys.exit(1)
