@@ -335,7 +335,8 @@ class Repo(object):
             # https://git-scm.com/docs/partial-clone
             # Speeds up cloning by functioning without a complete copy of
             # repository
-            cmd += ('--filter=blob:none',)
+            # cmd += ('--filter=blob:none',)
+            pass
         # Try to clone target branch, if it exists
         rtype, _sha = self.query_remote_ref(repository, branch)
         if rtype in {'branch', 'tag'}:
